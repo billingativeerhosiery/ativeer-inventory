@@ -633,7 +633,7 @@ const GAuth = {
   // ── CONFIG — fill these in before deploying ──
   CLIENT_ID: '994336821409-cckpns19hs7pu83281tjfg36h6patu9n.apps.googleusercontent.com',
   ALLOWED_EMAIL: 'billing@ativeerhosiery.com', // only this account may use the app
-  SCOPES: 'https://www.googleapis.com/auth/drive.file',
+  SCOPES: 'https://www.googleapis.com/auth/drive.file https://www.googleapis.com/auth/userinfo.email https://www.googleapis.com/auth/userinfo.profile',
 
   tokenClient: null,
   accessToken: null,
@@ -711,8 +711,25 @@ const GAuth = {
       const r = await fetch('https://www.googleapis.com/oauth2/v3/userinfo', {
         headers: { Authorization: 'Bearer ' + this.accessToken }
       });
+      if (!r.ok) throw new Error('userinfo request failed: ' + r.status);
       const profile = await r.json();
-      this.userEmail = (profile.email || '').toLowerCase();
+      console.log('Signed in profile:', profile); // remove once confirmed working, kept for now to help debug
+
+      if (!profile.email) {
+        // We have a valid token but couldn't read the email — this means the
+        // granted scope didn't include email access. Don't silently deny;
+        // surface this clearly so it's not mistaken for a wrong-account error.
+        document.getElementById('auth-spin-wrap').style.display = 'none';
+        document.getElementById('auth-denied-wrap').innerHTML =
+          '<div class="auth-denied"><strong>Could not read account email</strong>'
+          + 'Sign-in succeeded but Google did not return an email address. '
+          + 'This usually means the app needs you to grant email permission — '
+          + 'try signing in again and accept all permissions requested.</div>'
+          + '<div style="margin-top:14px"><button class="btn bo" onclick="GAuth.retryAuth()">Try again</button></div>';
+        return;
+      }
+
+      this.userEmail = profile.email.toLowerCase();
       this.userPicture = profile.picture || '';
 
       if (this.userEmail !== this.ALLOWED_EMAIL.toLowerCase()) {
@@ -721,6 +738,7 @@ const GAuth = {
       }
       this._onSignedIn();
     } catch (e) {
+      console.error('Profile fetch error', e);
       document.getElementById('auth-spin-wrap').style.display = 'none';
       document.getElementById('auth-btn-wrap').style.display = 'block';
       App.toast?.('Could not verify account. Try again.', 'err');
@@ -729,9 +747,10 @@ const GAuth = {
 
   _showDenied(email) {
     document.getElementById('auth-spin-wrap').style.display = 'none';
+    const emailDisplay = email ? '<strong>' + esc(email) + '</strong>' : 'a different account';
     document.getElementById('auth-denied-wrap').innerHTML =
       '<div class="auth-denied"><strong>Access restricted</strong>'
-      + 'You signed in as <strong>' + esc(email) + '</strong>, but this tool only allows '
+      + 'You signed in as ' + emailDisplay + ', but this tool only allows '
       + '<strong>' + esc(this.ALLOWED_EMAIL) + '</strong>. '
       + 'Sign in with the correct shared account, or ask whoever manages it for the password.</div>'
       + '<div style="margin-top:14px"><button class="btn bo" onclick="GAuth.retryAuth()">Try a different account</button></div>';
