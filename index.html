@@ -681,7 +681,7 @@ const GAuth = {
     document.getElementById('auth-denied-wrap').innerHTML = '';
     document.getElementById('auth-spin-wrap').style.display = 'flex';
     document.getElementById('auth-btn-wrap').style.display = 'none';
-    this.tokenClient.requestAccessToken({ prompt: 'select_account' });
+    this.tokenClient.requestAccessToken({ prompt: 'consent' });
   },
 
   signOut() {
