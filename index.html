@@ -803,8 +803,14 @@ const Drive = {
       App.afterDriveReady();
     } catch (e) {
       console.error('Drive init error', e);
-      this._setSyncStatus('err', 'Offline: ' + (e.message || 'unknown error').slice(0,40));
-      // Fall back to whatever is in localStorage so the app still works
+      if (e.tokenExpired) {
+        this._setSyncStatus('err', 'Session expired — sign in again');
+        GAuth.accessToken = null;
+        App.toast('Session expired during load. Please sign out and sign in again.', 'warn');
+      } else {
+        this._setSyncStatus('err', 'Offline: ' + (e.message || 'unknown error').slice(0,40));
+      }
+      // Fall back to localStorage regardless
       DB.load(); Seed.run();
       App.afterDriveReady();
     }
@@ -879,6 +885,10 @@ const Drive = {
       },
       body
     });
+    if (res.status === 401) {
+      // Token has expired — throw a specific error so _flushSave can prompt re-auth
+      throw Object.assign(new Error('TOKEN_EXPIRED'), { tokenExpired: true });
+    }
     if (!res.ok) throw new Error('Upload failed: ' + res.status);
     const json = await res.json();
     if (!this.fileId) this.fileId = json.id;
@@ -903,7 +913,14 @@ const Drive = {
       this._setSyncStatus('ok', 'Synced');
     } catch (e) {
       console.error('Drive save error', e);
-      this._setSyncStatus('err', 'Sync failed — saved locally only');
+      if (e.tokenExpired) {
+        // OAuth token has expired (1hr limit) — clear it and prompt re-auth
+        this._setSyncStatus('err', 'Session expired — sign in again');
+        GAuth.accessToken = null;
+        App.toast('Your session has expired. Please sign out and sign in again to continue syncing to Drive.', 'warn');
+      } else {
+        this._setSyncStatus('err', 'Sync failed — saved locally');
+      }
     } finally {
       this._saving = false;
       if (this._pendingSave) this._flushSave();
@@ -989,7 +1006,7 @@ const DB = {
   applyAllocs(allocs) {
     allocs.forEach(a=>{
       const i=this.st.batches.findIndex(b=>b.id===a.bId);
-      if(i>=0) this.st.batches[i].rem-=a.qty;
+      if(i>=0) this.st.batches[i].rem=Math.max(0, this.st.batches[i].rem-a.qty);
     });
     this.save();
   },
@@ -1221,7 +1238,9 @@ const DASH = {
     } else { ab.innerHTML=''; }
 
     const tx=DB.st.txLog.slice(0,12);
-    const tl={IN:'\ud83d\udce5',OUT:'\ud83d\udce4',ADJ:'\ud83d\udd27'};
+    const tl={IN:'\ud83d\udce5',OUT:'\ud83d\udce4','ADJ-IN':'\ud83d\udd27','ADJ-OUT':'\ud83d\udd27',ADJ:'\ud83d\udd27'};
+    const isRed=t=>t.type==='OUT'||t.type==='ADJ-OUT';
+    const sign=t=>isRed(t)?'\u2212':'+';
     document.getElementById('d-tx').innerHTML=tx.length===0
       ?'<div class="es"><div class="ei">\ud83d\udcad</div><p>No transactions yet.</p></div>'
       :'<table><thead><tr><th>Date</th><th>Type</th><th>Ref</th><th>Item</th><th>Qty</th></tr></thead><tbody>'
@@ -1231,8 +1250,8 @@ const DASH = {
             +'<td>'+(tl[t.type]||'\u2022')+' '+t.type+'</td>'
             +'<td style="font-size:11px">'+esc(t.ref||'\u2014')+'</td>'
             +'<td>'+esc(it?.name||'\u2014')+' <small style="color:var(--muted)">'+esc(v?.size||'')+'</small></td>'
-            +'<td><strong style="color:'+(t.type==='OUT'?'var(--red)':'var(--green)')
-            +'">'+(t.type==='OUT'?'\u2212':'+')+' '+fN(t.qty)+'</strong></td></tr>';
+            +'<td><strong style="color:'+(isRed(t)?'var(--red)':'var(--green)')
+            +'">'+sign(t)+' '+fN(t.qty)+'</strong></td></tr>';
         }).join('')+'</tbody></table>';
     App.badge();
     this.renderCharts();
@@ -1799,11 +1818,17 @@ const ITM = {
   saveVar() {
     const iId=document.getElementById('var-item-sel').value;
     if(!iId){App.toast('Select an item','err');return;}
-    const item=DB.find('items',iId);let cnt=0;
+    const item=DB.find('items',iId);let cnt=0, skipped=0;
     document.querySelectorAll('#var-new-rows .rl').forEach(row=>{
       const sz=row.querySelector('.va-sz').value.trim();
       if(!sz) return;
       const vSku=item.sku+'-'+sz.replace(/[^A-Za-z0-9]/g,'').toUpperCase();
+      // Check SKU uniqueness across all variants before inserting
+      if(DB.st.variants.some(v=>v.sku===vSku)){
+        skipped++;
+        App.toast('Skipped duplicate variant SKU: '+vSku,'warn');
+        return;
+      }
       DB.ins('variants',{id:uid(),iId,sku:vSku,size:sz,color:'',cost:parseFloat(row.querySelector('.va-co').value)||item.cost});
       cnt++;
     });
@@ -2208,7 +2233,7 @@ const ADJ = {
           +'<td>'+esc(v?.size||'—')+'</td>'
           +'<td>'+fN(a.sysQty)+'</td>'
           +'<td>'+fN(a.actualQty)+'</td>'
-          +'<td><strong style="color:'+(diff>=0?'var(--green)':'var(--red)')+'">'+(diff>=0?'+':'')+fN(diff)+'</strong></td>'
+          +'<td><strong style="color:'+(diff>=0?'var(--green)':'var(--red)')+'">'+(diff>0?'+':diff<0?'-':'')+Math.abs(diff).toLocaleString('en-IN')+'</strong></td>'
           +'<td><span class="badge bn">'+esc(a.reason)+'</span></td>'
           +'<td style="font-size:11px;color:var(--muted)">'+esc(a.notes||'—')+'</td>'
           +'</tr>';
@@ -2267,10 +2292,12 @@ const ADJ = {
   },
   calcDiff() {
     const sys=parseInt(document.getElementById('adj-sys').textContent.replace(/,/g,''))||0;
-    const cnt=parseInt(document.getElementById('adj-cnt').value)||0;
+    const cnt=parseInt(document.getElementById('adj-cnt').value);
+    if(isNaN(cnt)){ document.getElementById('adj-diff').textContent='—'; document.getElementById('adj-diff').className=''; return; }
     const diff=cnt-sys;
     const el=document.getElementById('adj-diff');
-    el.textContent=(diff>=0?'+':'')+fN(diff);
+    // Note: can't use fN() here — it clamps negative numbers to 0
+    el.textContent=(diff>0?'+':'')+Math.round(diff).toLocaleString('en-IN');
     el.className=diff>0?'dpos':diff<0?'dneg':'';
   },
   save() {
@@ -2295,9 +2322,13 @@ const ADJ = {
         if(res) DB.applyAllocs(res);
       }
       DB.setStock(vId,wId,actualQty);
-      DB.log('ADJ',adjNo+' ('+reason+')',vId,wId,Math.abs(diff));
+      // Log with actual diff — negative for reductions, positive for additions
+      // Type stored as ADJ-IN or ADJ-OUT so reports can show correct colour/sign
+      DB.log(diff>0?'ADJ-IN':'ADJ-OUT',adjNo+' ('+reason+')',vId,wId,Math.abs(diff));
     }
-    App.toast('Adjustment applied: '+(diff>=0?'+':'')+fN(diff)+' units ('+reason+')');
+    // Toast shows the real direction with correct sign
+    const diffDisplay=(diff>0?'+':diff<0?'-':'')+Math.abs(diff).toLocaleString('en-IN');
+    App.toast('Adjustment applied: '+diffDisplay+' units ('+reason+')');
     App.cm('m-adj');this.render();DASH.load();App.badge();
   }
 };
@@ -2446,16 +2477,21 @@ const RPT = {
       else if(sort==='name') rows.sort((a,b)=>(a.it?.name||'').localeCompare(b.it?.name||''));
       // else date-d: default order (txLog is newest-first)
       el.innerHTML='<table><thead><tr><th>Date</th><th>Type</th><th>Reference</th><th>Warehouse</th><th>Item</th><th>Size</th><th>Qty</th></tr></thead><tbody>'
-        +rows.map(({t,v,it,w})=>'<tr>'
-          +'<td style="white-space:nowrap;font-size:11px">'+fD(t.at)+'</td>'
-          +'<td><strong style="color:'+(t.type==='OUT'?'var(--red)':'var(--green)')+'">'+t.type+'</strong></td>'
-          +'<td style="font-size:11px;font-family:monospace">'+esc(t.ref||'—')+'</td>'
-          +'<td>'+esc(w?.name||'—')+'</td>'
-          +'<td>'+esc(it?.name||'—')+'</td>'
-          +'<td>'+esc(v?.size||'—')+'</td>'
-          +'<td><strong style="color:'+(t.type==='OUT'?'var(--red)':'var(--green)')
-          +'">'+(t.type==='OUT'?'−':'+')+' '+fN(t.qty)+'</strong></td>'
-          +'</tr>').join('')+'</tbody></table>';
+        +rows.map(({t,v,it,w})=>{
+          const red=t.type==='OUT'||t.type==='ADJ-OUT';
+          const col=red?'var(--red)':'var(--green)';
+          const pfx=red?'−':'+';
+          const label=t.type==='ADJ-IN'?'ADJ ↑':t.type==='ADJ-OUT'?'ADJ ↓':t.type;
+          return '<tr>'
+            +'<td style="white-space:nowrap;font-size:11px">'+fD(t.at)+'</td>'
+            +'<td><strong style="color:'+col+'">'+label+'</strong></td>'
+            +'<td style="font-size:11px;font-family:monospace">'+esc(t.ref||'—')+'</td>'
+            +'<td>'+esc(w?.name||'—')+'</td>'
+            +'<td>'+esc(it?.name||'—')+'</td>'
+            +'<td>'+esc(v?.size||'—')+'</td>'
+            +'<td><strong style="color:'+col+'">'+pfx+' '+fN(t.qty)+'</strong></td>'
+            +'</tr>';
+        }).join('')+'</tbody></table>';
     }
 
     if(type==='val'){
