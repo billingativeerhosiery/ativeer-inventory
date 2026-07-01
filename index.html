@@ -784,6 +784,7 @@ const Drive = {
   async init() {
     this._setSyncStatus('busy', 'Connecting…');
     try {
+      await this._waitForGapi();
       await this._findOrCreateFolder();
       await this._findOrCreateFile();
       const remote = await this._downloadJSON();
@@ -801,11 +802,26 @@ const Drive = {
       App.afterDriveReady();
     } catch (e) {
       console.error('Drive init error', e);
-      this._setSyncStatus('err', 'Offline — using local copy');
+      this._setSyncStatus('err', 'Offline: ' + (e.message || 'unknown error').slice(0,40));
       // Fall back to whatever is in localStorage so the app still works
       DB.load(); Seed.run();
       App.afterDriveReady();
     }
+  },
+
+  // The Drive API discovery doc loads asynchronously in the background (see GAuth.init).
+  // If the user clicks "Sign in" quickly, gapi.client.drive may not exist yet —
+  // wait for it instead of failing straight into offline mode.
+  _waitForGapi(timeoutMs = 8000) {
+    return new Promise((resolve, reject) => {
+      const start = Date.now();
+      const poll = () => {
+        if (window.gapi?.client?.drive) return resolve();
+        if (Date.now() - start > timeoutMs) return reject(new Error('Google Drive API took too long to load'));
+        setTimeout(poll, 150);
+      };
+      poll();
+    });
   },
 
   async _findOrCreateFolder() {
