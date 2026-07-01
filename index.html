@@ -943,9 +943,24 @@ const DB = {
   load() {
     try { const r = localStorage.getItem(this.KEY); this.st = r ? JSON.parse(r) : this.def(); }
     catch(e) { this.st = this.def(); }
-    // schema migrations for users on older backups
-    if(!this.st.categories) this.st.categories = ['Socks','Underwear'];
+    // ── Schema migrations ──────────────────────────────
+    if(!this.st.categories)  this.st.categories  = ['Socks','Underwear'];
     if(!this.st.adjustments) this.st.adjustments = [];
+    // Fix old ADJ txLog entries that predate the ADJ-IN/ADJ-OUT system.
+    // Match each old 'ADJ' entry to its adjustment record via reference number,
+    // then correct the type based on whether diff was positive or negative.
+    let migrated = 0;
+    this.st.txLog.forEach((t, i) => {
+      if (t.type === 'ADJ') {
+        const adjNo = t.ref ? t.ref.split(' ')[0] : null;
+        const adj   = adjNo ? this.st.adjustments.find(a => a.no === adjNo) : null;
+        if (adj) {
+          this.st.txLog[i].type = adj.diff > 0 ? 'ADJ-IN' : 'ADJ-OUT';
+          migrated++;
+        }
+      }
+    });
+    if (migrated > 0) { this.save(); console.log('Migrated ' + migrated + ' old ADJ txLog entries'); }
     return this.st;
   },
   save() {
@@ -2223,7 +2238,7 @@ const ADJ = {
   render() {
     const adjs=[...DB.st.adjustments].reverse(),el=document.getElementById('adj-tbl');
     if(!adjs.length){el.innerHTML='<div class="es"><div class="ei">\ud83d\udd27</div><p>No adjustments yet. Use after physical stock count.</p></div>';return;}
-    el.innerHTML='<table><thead><tr><th>Date</th><th>Warehouse</th><th>Item</th><th>Size</th><th>System Qty</th><th>Physical Count</th><th>Difference</th><th>Reason</th><th>Notes</th></tr></thead><tbody>'
+    el.innerHTML='<table><thead><tr><th>Date</th><th>Warehouse</th><th>Item</th><th>Size</th><th>System Qty</th><th>Physical Count</th><th>Difference</th><th>Reason</th><th>Notes</th><th>Action</th></tr></thead><tbody>'
       +adjs.map(a=>{
         const w=DB.find('warehouses',a.wId),v=DB.find('variants',a.vId),it=v?DB.find('items',v.iId):null,diff=a.actualQty-a.sysQty;
         return '<tr class="'+(diff<0?'low':diff>0?'warn':'')+'">'
@@ -2236,6 +2251,7 @@ const ADJ = {
           +'<td><strong style="color:'+(diff>=0?'var(--green)':'var(--red)')+'">'+(diff>0?'+':diff<0?'-':'')+Math.abs(diff).toLocaleString('en-IN')+'</strong></td>'
           +'<td><span class="badge bn">'+esc(a.reason)+'</span></td>'
           +'<td style="font-size:11px;color:var(--muted)">'+esc(a.notes||'—')+'</td>'
+          +'<td><button class="btn br btn-xs" data-id="'+a.id+'" onclick="ADJ.del(this.dataset.id)">\ud83d\uddd1 Delete</button></td>'
           +'</tr>';
       }).join('')+'</tbody></table>';
   },
@@ -2330,6 +2346,43 @@ const ADJ = {
     const diffDisplay=(diff>0?'+':diff<0?'-':'')+Math.abs(diff).toLocaleString('en-IN');
     App.toast('Adjustment applied: '+diffDisplay+' units ('+reason+')');
     App.cm('m-adj');this.render();DASH.load();App.badge();
+  },
+  del(id) {
+    const a=DB.find('adjustments',id);
+    if(!a){ App.toast('Entry not found','err'); return; }
+    const v=DB.find('variants',a.vId),it=v?DB.find('items',v.iId):null;
+    const label=(it?.name||'?')+' '+(v?.size||'');
+    const diff=a.actualQty-a.sysQty;
+    const msg=diff===0
+      ? 'Delete this adjustment entry? (No stock change was made so nothing to reverse.)'
+      : 'Delete this adjustment for '+label+'?\n\n'
+        +'• Difference was: '+(diff>0?'+':'')+diff+' units\n'
+        +'• Stock will be restored from '+a.actualQty+' back to '+a.sysQty+'\n'
+        +(diff<0?'• Note: stock reductions are restored as a new batch (FIFO history cannot be perfectly reversed)\n':'')
+        +'\nThis cannot be undone.';
+    if(!confirm(msg)) return;
+    if(diff!==0){
+      if(diff>0){
+        // Was an ADJ-IN: remove the batch that was created and subtract stock
+        const bIdx=DB.st.batches.findIndex(b=>b.no===a.no+'-B01');
+        if(bIdx>=0){
+          DB.st.batches.splice(bIdx,1);
+          DB.save();
+        }
+        DB.addStock(a.vId,a.wId,-diff);
+      } else {
+        // Was an ADJ-OUT: restore the quantity as a compensating batch at item's current cost
+        DB.ins('batches',{id:uid(),no:a.no+'-REV',vId:a.vId,wId:a.wId,rId:null,
+          received:Math.abs(diff),rem:Math.abs(diff),cost:v?.cost||0,on:new Date().toISOString()});
+        DB.addStock(a.vId,a.wId,Math.abs(diff));
+      }
+    }
+    // Remove matching txLog entries
+    DB.st.txLog=DB.st.txLog.filter(t=>!t.ref?.startsWith(a.no));
+    DB.del('adjustments',id);
+    DB.save();
+    App.toast('Adjustment deleted and stock restored to '+fN(a.sysQty),'warn');
+    this.render();DASH.load();App.badge();
   }
 };
 
